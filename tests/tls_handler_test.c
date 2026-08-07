@@ -790,6 +790,134 @@ static int s_tls_channel_echo_and_backpressure_test_fn(struct aws_allocator *all
 
 AWS_TEST_CASE(tls_channel_echo_and_backpressure_test, s_tls_channel_echo_and_backpressure_test_fn)
 
+struct tls_handler_write_completion {
+    struct aws_mutex *mutex;
+    struct aws_condition_variable *condition_variable;
+    bool completed;
+    int error_code;
+};
+
+static void s_tls_handler_write_completion_fn(
+    struct aws_channel *channel,
+    struct aws_io_message *message,
+    int err_code,
+    void *user_data) {
+
+    (void)channel;
+    (void)message;
+    struct tls_handler_write_completion *completion = user_data;
+    aws_mutex_lock(completion->mutex);
+    completion->completed = true;
+    completion->error_code = err_code;
+    aws_mutex_unlock(completion->mutex);
+    aws_condition_variable_notify_one(completion->condition_variable);
+}
+
+static bool s_tls_handler_write_completion_predicate(void *user_data) {
+    struct tls_handler_write_completion *completion = user_data;
+    return completion->completed;
+}
+
+struct tls_handler_write_task_args {
+    struct aws_channel_handler *tls_handler;
+    struct aws_channel_slot *tls_slot;
+    struct aws_byte_buf *buffer;
+    struct tls_handler_write_completion *completion;
+    struct aws_channel_task task;
+};
+
+static void s_tls_handler_write_task(struct aws_channel_task *task, void *arg, enum aws_task_status status) {
+    (void)task;
+    (void)status;
+    struct tls_handler_write_task_args *write_args = arg;
+    AWS_FATAL_ASSERT(
+        aws_tls_handler_write(
+            write_args->tls_handler,
+            write_args->tls_slot,
+            write_args->buffer,
+            s_tls_handler_write_completion_fn,
+            write_args->completion) == AWS_OP_SUCCESS);
+}
+
+/* Verify that aws_tls_handler_write() encrypts plaintext directly through the TLS handler and that the peer receives
+ * the decrypted data. This exercises the write path without an upstream handler feeding the TLS handler. */
+static int s_tls_channel_handler_write_test_fn(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+    ASSERT_SUCCESS(s_tls_channel_server_client_tester_init(allocator));
+    struct tls_test_rw_args *client_rw_args = &s_server_client_tester.client_rw_args;
+    struct tls_test_rw_args *server_rw_args = &s_server_client_tester.server_rw_args;
+    struct tls_test_args *client_args = &s_server_client_tester.client_args;
+    struct tls_test_args *server_args = &s_server_client_tester.server_args;
+
+    struct aws_byte_buf write_tag = aws_byte_buf_from_c_str("I'm a little teapot.");
+
+    struct aws_channel_handler *client_rw_handler =
+        rw_handler_new(allocator, s_tls_test_handle_read, s_tls_test_handle_write, true, 10000, client_rw_args);
+    ASSERT_NOT_NULL(client_rw_handler);
+    struct aws_channel_handler *server_rw_handler =
+        rw_handler_new(allocator, s_tls_test_handle_read, s_tls_test_handle_write, true, 10000, server_rw_args);
+    ASSERT_NOT_NULL(server_rw_handler);
+    server_args->rw_handler = server_rw_handler;
+    client_args->rw_handler = client_rw_handler;
+
+    g_aws_channel_max_fragment_size = 4096;
+    ASSERT_SUCCESS(s_set_socket_channel(&s_server_client_tester));
+
+    /* The TLS handler sits immediately to the left of the client's read/write test handler. */
+    struct aws_channel_slot *tls_slot = client_args->rw_slot->adj_left;
+    ASSERT_NOT_NULL(tls_slot);
+
+    struct tls_handler_write_completion completion = {
+        .mutex = &c_tester.mutex,
+        .condition_variable = &c_tester.condition_variable,
+        .completed = false,
+        .error_code = -1,
+    };
+    struct tls_handler_write_task_args write_args = {
+        .tls_handler = tls_slot->handler,
+        .tls_slot = tls_slot,
+        .buffer = &write_tag,
+        .completion = &completion,
+    };
+    aws_channel_task_init(
+        &write_args.task, s_tls_handler_write_task, &write_args, "tls_handler_write_test");
+    aws_channel_schedule_task_now(client_args->channel, &write_args.task);
+
+    /* Server should receive the plaintext after the TLS handler decrypts it. */
+    ASSERT_SUCCESS(aws_mutex_lock(&s_server_client_tester.server_mutex));
+    ASSERT_SUCCESS(aws_condition_variable_wait_pred(
+        &s_server_client_tester.server_condition_variable,
+        &s_server_client_tester.server_mutex,
+        s_tls_test_read_predicate,
+        server_rw_args));
+    ASSERT_SUCCESS(aws_mutex_unlock(&s_server_client_tester.server_mutex));
+
+    ASSERT_BIN_ARRAYS_EQUALS(
+        write_tag.buffer, write_tag.len, server_rw_args->received_message.buffer, server_rw_args->received_message.len);
+
+    /* The write completion callback should have fired with no error. */
+    ASSERT_SUCCESS(aws_mutex_lock(&c_tester.mutex));
+    ASSERT_SUCCESS(aws_condition_variable_wait_pred(
+        &c_tester.condition_variable, &c_tester.mutex, s_tls_handler_write_completion_predicate, &completion));
+    ASSERT_SUCCESS(aws_mutex_unlock(&c_tester.mutex));
+    ASSERT_INT_EQUALS(AWS_OP_SUCCESS, completion.error_code);
+
+    aws_channel_shutdown(server_args->channel, AWS_OP_SUCCESS);
+    ASSERT_SUCCESS(aws_mutex_lock(&s_server_client_tester.server_mutex));
+    ASSERT_SUCCESS(aws_condition_variable_wait_pred(
+        &s_server_client_tester.server_condition_variable,
+        &s_server_client_tester.server_mutex,
+        s_tls_channel_shutdown_predicate,
+        &s_server_client_tester.server_args));
+    ASSERT_SUCCESS(aws_mutex_unlock(&s_server_client_tester.server_mutex));
+
+    ASSERT_SUCCESS(s_tls_channel_server_client_tester_cleanup());
+
+    return AWS_OP_SUCCESS;
+}
+
+AWS_TEST_CASE(tls_channel_handler_write_test, s_tls_channel_handler_write_test_fn)
+
 static struct aws_byte_buf s_on_client_recive_shutdown_with_cache_data(
     struct aws_channel_handler *handler,
     struct aws_channel_slot *slot,

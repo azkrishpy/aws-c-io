@@ -897,6 +897,48 @@ bool aws_tls_is_cipher_pref_supported(enum aws_tls_cipher_pref cipher_pref) {
 
 #endif /* BYO_CRYPTO */
 
+int aws_tls_handler_write(
+    struct aws_channel_handler *handler,
+    struct aws_channel_slot *slot,
+    struct aws_byte_buf *buf,
+    aws_channel_on_message_write_completed_fn *on_write_completed,
+    void *completion_user_data) {
+
+    AWS_PRECONDITION(handler);
+    AWS_PRECONDITION(slot);
+    AWS_PRECONDITION(buf);
+
+    /* Feed the plaintext through the TLS handler's own write path (process_write_message), which encrypts it and
+     * sends it downstream. A pooled message may be smaller than buf, so split across as many messages as needed and
+     * only attach the completion callback to the final message. */
+    struct aws_byte_cursor remaining = aws_byte_cursor_from_buf(buf);
+    do {
+        struct aws_io_message *message = aws_channel_acquire_message_from_pool(
+            slot->channel, AWS_IO_MESSAGE_APPLICATION_DATA, remaining.len);
+
+        const size_t chunk_len = aws_min_size(remaining.len, message->message_data.capacity);
+        struct aws_byte_cursor chunk = aws_byte_cursor_advance(&remaining, chunk_len);
+        if (!aws_byte_buf_write_from_whole_cursor(&message->message_data, chunk)) {
+            aws_mem_release(message->allocator, message);
+            return AWS_OP_ERR;
+        }
+
+        /* Only the last message carries the completion callback. */
+        if (remaining.len == 0) {
+            message->on_completion = on_write_completed;
+            message->user_data = completion_user_data;
+        }
+
+        if (handler->vtable->process_write_message(handler, slot, message)) {
+            /* On failure the handler does not take ownership of the message. */
+            aws_mem_release(message->allocator, message);
+            return AWS_OP_ERR;
+        }
+    } while (remaining.len > 0);
+
+    return AWS_OP_SUCCESS;
+}
+
 int aws_channel_setup_client_tls(
     struct aws_channel_slot *right_of_slot,
     struct aws_tls_connection_options *tls_options) {
